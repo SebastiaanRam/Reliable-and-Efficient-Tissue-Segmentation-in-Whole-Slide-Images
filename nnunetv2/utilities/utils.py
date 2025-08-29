@@ -25,6 +25,8 @@ from multiprocessing import Pool
 from pathlib import Path
 
 import os
+import logging
+log = logging.getLogger(__name__)
 
 
 # def get_identifiers_from_splitted_dataset_folder(folder: str, file_ending: str):
@@ -289,6 +291,9 @@ def image_from_scan(scan_path, target_mpp, bg_value_hex_str):
         target_height = round(lvl0_height / target_factor_y)
         target_width = round(lvl0_width / target_factor_x)
 
+
+        log.info(f"Requested resize to target_width={target_width}, target_height={target_height}")
+        log.info(f"Read image shape: {read_image.shape}")
         # Do extra resizing to fit output shape exactly
         resized_image = cv2.resize(
             read_image, (target_width, target_height), interpolation=cv2.INTER_AREA

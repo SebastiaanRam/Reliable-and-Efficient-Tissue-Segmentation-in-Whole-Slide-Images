@@ -1,7 +1,7 @@
 version: '2'
 services:
   tissue_segmentation:
-    image: tissue_segmentation 
+    image: dockerdex.umcn.nl:5005/sebastiaanram/reliable-and-efficient-tissue-segmentation-in-whole-slide-images 
     ports:
       - "5000:5000"
     build:
@@ -11,7 +11,7 @@ services:
 
     volumes:
             - ../:/nnUNet
-            - /media:/media
+            #  - /media:/media
             - ../models:/models
     environment:
               - nnUNet_raw=/path/to/raw
