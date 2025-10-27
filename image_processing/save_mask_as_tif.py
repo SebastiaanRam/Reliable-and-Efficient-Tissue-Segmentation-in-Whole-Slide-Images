@@ -1,11 +1,8 @@
-slide_path = "/data/temporary/sebastiaan/github/Reliable-and-Efficient-Tissue-Segmentation-in-Whole-Slide-Images/images/DI_S03_P000001_C0023_B101_T01_L37_A32_E001.tif"
-path = "/data/temporary/sebastiaan/github/Reliable-and-Efficient-Tissue-Segmentation-in-Whole-Slide-Images/images/masks/DI_S03_P000001_C0023_B101_T01_L37_A32_E001.png"
-out = "/data/temporary/sebastiaan/github/Reliable-and-Efficient-Tissue-Segmentation-in-Whole-Slide-Images/images/masks/DI_S03_P000001_C0023_B101_T01_L37_A32_E001.tif"
-
 from wholeslidedata import WholeSlideImage
 from wholeslidedata.interoperability.asap.imagewriter import WholeSlideMaskWriter, WholeSlideImageWriter
 from PIL import Image
 import numpy as np
+import argparse
 
 def take_closest_number(l, number):
     return min(l, key=lambda x: abs(x - number))
@@ -59,11 +56,18 @@ def save_normal_image_as_mask(path, slide_path, out_path):
     mask.close()
 
     heights = [hw[0] for hw in shapes]
-    level = take_closest_number_index(heights, h)
+    level = 0
     print('for mask shape(%d,%d) closest level %d with spacing  %.3f, shape %s' % \
           (h, w, level, spacings[level], str(shapes[level])))
 
     spacing = spacings[level]
+    print('saving mask with spacing %.3f to %s' % (spacing, out_path))
     return save_array_as_image(mask_arr, spacing=spacing, path=out_path)
 
-save_normal_image_as_mask(path, slide_path, out)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Save image mask as pyramidal tif for a given slide.")
+    parser.add_argument("--slide_path", type=str, required=True, help="Path to the slide .tif file")
+    parser.add_argument("--mask_path", type=str, required=True, help="Path to the mask image file (png, jpeg)")
+    parser.add_argument("--out_path", type=str, required=True, help="Output path for the pyramidal tif")
+    args = parser.parse_args()
+    save_normal_image_as_mask(args.mask_path, args.slide_path, args.out_path)

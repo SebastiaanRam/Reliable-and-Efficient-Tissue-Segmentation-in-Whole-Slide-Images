@@ -1,5 +1,5 @@
 # Base image
-FROM dockerdex.umcn.nl:5005/diag/base-images:base-pt2.1
+FROM dockerdex.umcn.nl:5005/diag/base-images:pathology-pt2.7.1 
 
 # Set working directory
 WORKDIR /resources
@@ -19,22 +19,23 @@ RUN apt-get update && apt-get install --yes \
     vim && \
     rm -rf /var/lib/apt/lists/*
 
-
+RUN pip3 install --no-cache-dir --upgrade git+https://github.com/DIAGNijmegen/pathology-whole-slide-data@main
+# Use blosc2<=3.8.0 because from 3.9.0 the package requires numpy>2.0
+RUN pip3 install --no-cache-dir "blosc2<=3.8.0"
 
 # Set working directory for nnUNet
 WORKDIR /nnUNet
 
 # Copy nnUNet source code into the image
 COPY . /nnUNet
-COPY models /models
 
 # Install nnUNet in editable mode
-RUN pip install --no-cache-dir -e .
+RUN pip3 install --no-cache-dir -e .
 
 # Replicate docker-compose environment variables
-ENV nnUNet_raw=/path/to/raw \
-    nnUNet_preprocessed=/path/to/preprocessed \
-    nnUNet_results=/path/to/results
+ENV nnUNet_raw=/tmp \
+    nnUNet_preprocessed=/tmp \
+    nnUNet_results=/tmp
 
 # Expose port 5000
 EXPOSE 5000

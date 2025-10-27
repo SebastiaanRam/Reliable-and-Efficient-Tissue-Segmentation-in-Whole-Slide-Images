@@ -1,0 +1,35 @@
+# Ignore SMB/network share files
+*.smb
+.smbdelete*
+
+# Ignore Vim swap files
+*.swp
+*.swo
+*~
+
+# Ignore common editor temporary files
+.*.swp
+.*.swo
+
+# Ignore other common temporary/cache files
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+
+# Ignore git files
+.git
+.gitignore
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Ignore common development files
+.vscode/
+.idea/
+*.log

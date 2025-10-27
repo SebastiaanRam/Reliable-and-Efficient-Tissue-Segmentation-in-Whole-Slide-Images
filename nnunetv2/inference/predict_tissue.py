@@ -60,6 +60,9 @@ PngImagePlugin.MAX_TEXT_CHUNK = LARGE_ENOUGH_NUMBER * (1024**2)
 from nnunetv2.preprocessing.preprocessors.default_preprocessor import DefaultPreprocessor
 from batchgenerators.utilities.file_and_folder_operations import load_pickle
 
+import shutil
+from image_processing.png_to_upscale_tif import save_array_as_image
+from wholeslidedata import WholeSlideImage
 
 def _preprocess_to_memory(case_id: str,
                           wsi_path: str,
@@ -95,7 +98,7 @@ class TissueNNUnetPredictor(nnUNetPredictor):
         parameters = []
         
         checkpoint = torch.load(join(model_training_output_dir, checkpoint_name),
-                                map_location=torch.device('cpu'))
+                                map_location=torch.device('cpu'), weights_only=False)
         trainer_name = checkpoint['trainer_name']
         configuration_name = checkpoint['init_args']['configuration']
         inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
@@ -133,6 +136,174 @@ class TissueNNUnetPredictor(nnUNetPredictor):
             print('Using torch.compile')
             self.network = torch.compile(self.network)
 
+    def predict_single_file(self, input_file: str, output_file: str):
+        """
+        Predict a single file and save the result as PNG.
+        This is the method called by run_inference.py for individual file processing.
+        
+        Args:
+            input_file (str): Path to input .tif/.tiff file
+            output_file (str): Path to output PNG mask file
+        """
+        # Use the existing streaming prediction infrastructure
+        output_folder = str(Path(output_file).parent)
+        maybe_mkdir_p(output_folder)
+        
+        # Create temporary list with single file
+        wsi_paths = [input_file]
+        
+        pp = DefaultPreprocessor(verbose=False)
+        plans, cfg, ds_json = self.plans_manager, self.configuration_manager, self.dataset_json
+        
+        # Process single file
+        case_id = Path(input_file).stem
+        cid, np_data, props, wsi_path = _preprocess_to_memory(
+            case_id, input_file, pp, plans, cfg, ds_json, lowres=False
+        )
+        
+        if np_data is None:
+            raise RuntimeError(f"Failed to preprocess {input_file}")
+        
+        try:
+            print(f"Predicting {case_id}")
+            logits = self.predict_logits_from_preprocessed_data(
+                torch.from_numpy(np_data).to(self.device)
+            ).cpu()
+            
+            export_prediction_from_logits(
+                logits, props, cfg, plans, ds_json,
+                output_file, save_probabilities=False, binary_01=False, 
+                postproc_cfg=None, extension=None
+            )
+            
+        finally:
+            del np_data, logits
+            torch.cuda.empty_cache()
+            gc.collect()
+
+    def predict_tissue_with_full_pipeline(self,
+                                          input_file: str,
+                                          output_folder: str,
+                                          tmp_path: str = "/tmp",
+                                          binary_01: bool = False,
+                                          postproc_cfg: dict = None) -> str:
+        """
+        Complete pipeline orchestrator that handles:
+        1. nnUNet inference (produces PNG)
+        2. PNG upscaling
+        3. Conversion to TIFF with proper metadata
+        4. Copy from tmp to final output
+        
+        Args:
+            input_file (str): Path to input .tif/.tiff file
+            output_folder (str): Path to output folder for final TIFF masks
+            tmp_path (str): Path to temporary folder
+            binary_01 (bool): Convert output to binary 0,1 instead of 0,255
+            postproc_cfg (dict): Post-processing configuration
+            
+        Returns:
+            str: Path to the generated TIFF mask
+        """
+        print(f"Running complete pipeline for: {input_file}")
+        
+        if not os.path.isfile(input_file):
+            raise FileNotFoundError(f"Input file not found: {input_file}")
+        
+        input_filename_stem = Path(input_file).stem
+        
+        # Create tmp masks folder with unique subdirectory for this file
+        tmp_masks_folder = Path(tmp_path) / "masks" / input_filename_stem
+        os.makedirs(tmp_masks_folder, exist_ok=True)
+        
+        ### Step 1: Run nnUNet inference ###
+        print("Step 1/3: Running nnUNet inference...")
+        # IMPORTANT: Don't include file extension - export_prediction_from_logits 
+        # automatically appends dataset_json['file_ending'] (usually '.png')
+        mask_png_path_truncated = str(tmp_masks_folder / input_filename_stem)
+        
+        # Use streaming prediction for single file
+        pp = DefaultPreprocessor(verbose=False)
+        plans, cfg, ds_json = self.plans_manager, self.configuration_manager, self.dataset_json
+        
+        case_id = input_filename_stem
+        cid, np_data, props, wsi_path = _preprocess_to_memory(
+            case_id, input_file, pp, plans, cfg, ds_json, lowres=False
+        )
+        
+        if np_data is None:
+            # Clean up and raise error
+            if tmp_masks_folder.exists():
+                shutil.rmtree(tmp_masks_folder)
+            raise RuntimeError(f"Failed to preprocess {input_file}")
+        
+        try:
+            logits = self.predict_logits_from_preprocessed_data(
+                torch.from_numpy(np_data).to(self.device)
+            ).cpu()
+            
+            export_prediction_from_logits(
+                logits, props, cfg, plans, ds_json,
+                mask_png_path_truncated, save_probabilities=False, 
+                binary_01=binary_01, postproc_cfg=postproc_cfg, extension=None
+            )
+            
+        finally:
+            del np_data
+            if 'logits' in locals():
+                del logits
+            torch.cuda.empty_cache()
+            gc.collect()
+    
+        # Reconstruct the actual file path (export_prediction_from_logits adds the extension)
+        mask_png_path = Path(mask_png_path_truncated + ds_json['file_ending'])
+        
+        if not mask_png_path.exists():
+            # Clean up and raise error
+            if tmp_masks_folder.exists():
+                shutil.rmtree(tmp_masks_folder)
+            raise FileNotFoundError(f"PNG mask not generated at {mask_png_path}")
+    
+        try:
+            ### Step 2: Upscale PNG mask in memory ###
+            print("Step 2/3: Upscaling mask...")
+            img = Image.open(mask_png_path)
+
+            with WholeSlideImage(input_file, backend='asap') as wsi:
+                target_size = wsi.shapes[0]
+                spacings = wsi.spacings
+                print(f"Target size: {target_size} at spacing {spacings[0]}")
+
+            upscaled = img.resize(target_size, Image.NEAREST)
+            upscaled_arr = np.array(upscaled)
+            img.close()
+            upscaled.close()
+
+            ### Step 3: Convert directly to TIFF ###
+            print("Step 3/3: Converting to TIFF with proper metadata...")
+            tmp_tif_path = str(mask_png_path.parent / f"{input_filename_stem}_mask.tif")
+            save_array_as_image(upscaled_arr, path=tmp_tif_path, spacing=spacings[0])
+            
+            # Copy final TIFF to output folder
+            os.makedirs(output_folder, exist_ok=True)
+            final_tif_path = os.path.join(output_folder, os.path.basename(tmp_tif_path))
+            
+            print(f"Copying final TIFF to output: {tmp_tif_path} -> {final_tif_path}")
+            shutil.copyfile(tmp_tif_path, final_tif_path)
+            
+            print(f"Pipeline completed successfully!")
+            print(f"Output mask saved to: {final_tif_path}")
+            
+            return final_tif_path
+    
+        finally:
+            # Clean up temporary files only after everything is done
+            try:
+                if tmp_masks_folder.exists():
+                    shutil.rmtree(tmp_masks_folder)
+                    print(f"Cleaned up temporary folder: {tmp_masks_folder}")
+            except Exception as e:
+                print(f"Warning: Failed to clean up temporary folder {tmp_masks_folder}: {e}")
+
     def predict_tissue_from_files(self,
                                   list_of_lists_or_source_folder,
                                   output_folder_or_list_of_truncated_output_files,
@@ -149,19 +320,53 @@ class TissueNNUnetPredictor(nnUNetPredictor):
                                   binary_01: bool = False,
                                   keep_parent: bool = False,
                                   lowres: bool = False,
-                                  pp_cfg: dict = None):
+                                  pp_cfg: dict = None,
+                                  use_full_pipeline: bool = False,
+                                  tmp_path: str = "/tmp"):
         
         output_folder = output_folder_or_list_of_truncated_output_files
         maybe_mkdir_p(output_folder)
 
-
+        # New: Full pipeline mode for single files or file lists
+        if use_full_pipeline:
+            print(f'[TissueNNUnetPredictor] Using full pipeline mode (PNG -> upscaled -> TIFF)...')
+            
+            # Get list of files to process
+            if list_of_lists_or_source_folder.lower().endswith('.txt'):
+                with open(list_of_lists_or_source_folder) as f:
+                    file_paths = [ln.strip() for ln in f if ln.strip()]
+            elif os.path.isfile(list_of_lists_or_source_folder):
+                file_paths = [list_of_lists_or_source_folder]
+            else:
+                # Assume it's a folder
+                file_paths = list(Path(list_of_lists_or_source_folder).rglob('*.tif'))
+                file_paths.extend(Path(list_of_lists_or_source_folder).rglob('*.tiff'))
+                file_paths = [str(f) for f in file_paths]
+            
+            # Process each file with full pipeline
+            for file_path in file_paths:
+                try:
+                    # Always place mask next to the input file
+                    file_output_folder = str(Path(file_path).parent)
+                    
+                    self.predict_tissue_with_full_pipeline(
+                        input_file=file_path,
+                        output_folder=file_output_folder,
+                        tmp_path=tmp_path,
+                        binary_01=binary_01,
+                        postproc_cfg=pp_cfg
+                    )
+                except Exception as e:
+                    print(f"Failed to process {file_path}: {e}")
+                    continue
+            
+            return
 
         if list_of_lists_or_source_folder.lower().endswith('.txt') or suffix is not None:
             print(f'[TissueNNUnetPredictor] Streaming WSI fully in memory...')
             self.predict_wsi_streaming(list_of_lists_or_source_folder, output_folder, suffix, extension, exclude, lowres=lowres, postproc_cfg=pp_cfg, overwrite=overwrite, cpu_workers=num_processes_preprocessing, binary_01=binary_01, keep_parent=keep_parent)
 
             return
-
 
         print(f'[TissueNNUnetPredictor] Detected img folder; using stock nnU-Net pipeline (blocking).')
         super().predict_from_files(
@@ -502,18 +707,17 @@ def predict_tissue_entry_point():
     if not args.resenc:
         print(f'Using {resolution}um model')
         predictor.initialize_from_trained_tissue_model_folder(
-            f'/models/trained_on_{resolution}um',
+            f'/data/temporary/sebastiaan/tissue_segmentation/models/trained_on_{resolution}um',
             use_folds='all',
             checkpoint_name=f'checkpoint_{resolution}um.pth',
         )
     else:
         print(f'Using {resolution}um model with ResEnc architecture')
         predictor.initialize_from_trained_tissue_model_folder(
-            f'/models/trained_on_{resolution}um_ResEnc',
+            f'/data/temporary/sebastiaan/tissue_segmentation/models/trained_on_{resolution}um_ResEnc',
             use_folds='all',
             checkpoint_name=f'checkpoint_{resolution}um_ResEnc.pth',
         )
-
 
 
     print(f"Time for loading model {time() - t0} seconds")
