@@ -37,7 +37,7 @@ def postproc(mask: np.ndarray,
     labels, num = cc3d.connected_components(mask, connectivity=8, return_N=True)
 
     if num == 0:
-        out = mask.astype(np.uin8)
+        out = mask.astype(np.uint8)
         return np.expand_dims(out, axis) if needs_unsqueeze else out
 
     sizes = np.bincount(labels.ravel())
